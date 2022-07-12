@@ -1,0 +1,202 @@
+/*
+ * This file is part of FFmpeg.
+ *
+ * FFmpeg is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * FFmpeg is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with FFmpeg; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ */
+
+#include <stdio.h>
+#include "libavutil/avstring.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/opt.h"
+#include "libswresample/swresample.h"
+#include "audio.h"
+#include "avfilter.h"
+#include "formats.h"
+#include "internal.h"
+
+#define MAX_CHANNELS 256
+
+
+typedef struct DownsampleContext {
+    const AVClass *class;
+    char *args;
+    int64_t out_channel_layout;
+    double gain[MAX_CHANNELS];
+
+    int nb_output_channels;
+    struct SwrContext *swr;
+} DownsampleContext;
+
+
+static av_cold int init(AVFilterContext *ctx)
+{
+	DownsampleContext *const downsample = ctx->priv;
+	char *args = av_strdup(downsample->args);
+
+//	int ret = ff_parse_channel_layout(&downsample->out_channel_layout,downsample->nb_output_channels, "1c", ctx);
+	downsample->out_channel_layout = av_get_channel_layout("1c");
+	downsample->nb_output_channels = 1;
+	return 0;
+}
+
+
+static int query_formats(AVFilterContext *ctx)
+{
+    DownsampleContext *downsample = ctx->priv;
+    AVFilterLink *inlink  = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFilterChannelLayouts *layouts;
+    int ret;
+
+    /* libswr supports any sample and packing formats */
+    if ((ret = ff_set_common_formats(ctx, ff_all_formats(AVMEDIA_TYPE_AUDIO))) < 0)
+        return ret;
+
+    if ((ret = ff_set_common_all_samplerates(ctx)) < 0)
+        return ret;
+
+    // inlink supports any channel layout
+    layouts = ff_all_channel_counts();
+    if ((ret = ff_channel_layouts_ref(layouts, &inlink->outcfg.channel_layouts)) < 0)
+        return ret;
+
+    // outlink supports only requested output channel layout
+    layouts = NULL;
+    if ((ret = ff_add_channel_layout(&layouts,
+            downsample->out_channel_layout ? downsample->out_channel_layout :
+            FF_COUNT2LAYOUT(downsample->nb_output_channels))) < 0)
+        return ret;
+
+    return ff_channel_layouts_ref(layouts, &outlink->incfg.channel_layouts);
+}
+
+static int config_props(AVFilterLink *link)
+{
+	int ret,j;
+	AVFilterContext *ctx = link->dst;
+	DownsampleContext *downsample = ctx->priv;
+
+
+	if (link->channels > MAX_CHANNELS) {
+		av_log(ctx, AV_LOG_ERROR,
+				"af_downsample supports a maximum of %d channels. "
+				"Feel free to ask for a higher limit.\n", MAX_CHANNELS);
+		return AVERROR_PATCHWELCOME;
+	}
+
+	// init libswresample context
+	downsample->swr = swr_alloc_set_opts(downsample->swr,
+			downsample->out_channel_layout, link->format, link->sample_rate,
+			link->channel_layout, link->format, link->sample_rate,
+			0, ctx);
+
+
+	if (!downsample->swr)
+		return AVERROR(ENOMEM);
+
+    if (!link->channel_layout) {
+        if (av_opt_set_int(downsample->swr, "ich", link->channels, 0) < 0)
+            return AVERROR(EINVAL);
+    }
+    if (!downsample->out_channel_layout) {
+        if (av_opt_set_int(downsample->swr, "och", downsample->nb_output_channels, 0) < 0)
+            return AVERROR(EINVAL);
+    }
+	// Filter we are using is not using pure gains;
+	int n = link->channels;
+	for (j=0; j<link->channels;j++)
+	{
+		downsample->gain[j] = (double)(1.0/(double)n);
+	}
+	av_log(ctx,AV_LOG_INFO, "DOWNSAMPLED GAINS\n");
+    av_opt_set_int(downsample->swr, "icl", link->channel_layout, 0);
+    av_opt_set_int(downsample->swr, "ocl", downsample->out_channel_layout, 0);
+	swr_set_matrix(downsample->swr, downsample->gain, MAX_CHANNELS);
+	av_log(ctx,AV_LOG_INFO, "Number of input channels %d \n",n);
+	ret = swr_init(downsample->swr);
+	if (ret < 0)
+		return ret;
+	return 0;
+}
+
+//static int filter_frame(AVFilterLink *inlink, AVFrame *in)
+static int filter_frame(AVFilterLink *inlink, AVFrame *insamples)
+{
+	int ret;
+	int n = insamples->nb_samples;
+	AVFilterLink *const outlink = inlink->dst->outputs[0];
+	AVFrame *outsamples = ff_get_audio_buffer(outlink, n);
+	DownsampleContext *downsample = inlink->dst->priv;
+
+	if (!outsamples) {
+		av_frame_free(&insamples);
+		return AVERROR(ENOMEM);
+	}
+	swr_convert(downsample->swr, outsamples->extended_data, n,
+				(void *)insamples->extended_data, n);
+
+    av_frame_copy_props(outsamples, insamples);
+    outsamples->channel_layout = outlink->channel_layout;
+    outsamples->channels = outlink->channels;
+
+    ret = ff_filter_frame(outlink, outsamples);
+    av_frame_free(&insamples);
+    return ret;
+}
+
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+	DownsampleContext *downsample = ctx->priv;
+	swr_free(&downsample->swr);
+}
+
+#define OFFSET(x) offsetof(DownsampleContext, x)
+
+static const AVOption downsample_options[] = {
+    { "args", NULL, OFFSET(args), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM },
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(downsample);
+
+static const AVFilterPad downsample_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_AUDIO,
+		.config_props = config_props,
+        .filter_frame = filter_frame,
+    },
+};
+
+static const AVFilterPad downsample_outputs[] = {
+    {
+        .name = "default",
+        .type = AVMEDIA_TYPE_AUDIO,
+    },
+};
+
+const AVFilter ff_af_downsample = {
+    .name          = "downsample",
+    .description   = NULL_IF_CONFIG_SMALL("Copy the input audio unchanged to the output."),
+	.priv_size 	   = sizeof(DownsampleContext),
+	.priv_class = &downsample_class,
+	.init = init,
+	.uninit = uninit,
+//    .flags         = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_INPUTS(downsample_inputs),
+    FILTER_OUTPUTS(downsample_outputs),
+	FILTER_QUERY_FUNC(query_formats),
+};
