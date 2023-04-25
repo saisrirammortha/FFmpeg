@@ -527,7 +527,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
         *q++ = 0xfc;        // private_data_byte
         *q++ = 0xfc;        // private_data_byte
     }
-
+    
+    /* put scte-35 registration tag */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+            break;
+        }
+    }
     val = 0xf000 | (q - program_info_length_ptr - 2);
     program_info_length_ptr[0] = val >> 8;
     program_info_length_ptr[1] = val;
