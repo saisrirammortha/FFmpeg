@@ -495,6 +495,7 @@ typedef struct AVProbeData {
                                         */
 
 #define AVFMT_SEEK_TO_PTS   0x4000000 /**< Seeking is based on PTS */
+extern int64_t scte_start_pts_time;
 
 /**
  * @addtogroup lavf_encoding

@@ -26,6 +26,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
+#include "libavutil/scte.h"
 
 #include "libavcodec/ac3_parser_internal.h"
 #include "libavcodec/internal.h"
@@ -350,6 +351,9 @@ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
     int stream_type;
 
     switch (st->codecpar->codec_id) {
+    case AV_CODEC_ID_SCTE_35:
+        stream_type = 0x86;
+        break;
     case AV_CODEC_ID_MPEG1VIDEO:
     case AV_CODEC_ID_MPEG2VIDEO:
         stream_type = STREAM_TYPE_VIDEO_MPEG2;
@@ -480,6 +484,9 @@ static int get_m2ts_stream_type(AVFormatContext *s, AVStream *st)
     case AV_CODEC_ID_HDMV_TEXT_SUBTITLE:
         stream_type = 0x92;
         break;
+    case AV_CODEC_ID_SCTE_35:
+    	stream_type = 0x86;
+    	break;
     default:
         av_log_once(s, AV_LOG_WARNING, AV_LOG_DEBUG, &ts_st->data_st_warning,
                     "Stream %d, codec %s, is muxed as a private data stream "
@@ -512,6 +519,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
         put16(&q, 0x0fff);  // CA_System_ID
         *q++ = 0xfc;        // private_data_byte
         *q++ = 0xfc;        // private_data_byte
+    }
+
+    /* put scte-35 registration tag */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35) {
+            put_registration_descriptor(&q, MKTAG('C', 'U', 'E', 'I'));
+            break;
+        }
     }
 
     val = 0xf000 | (q - program_info_length_ptr - 2);
@@ -1488,9 +1504,49 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
         force_nit = 1;
         ts->flags &= ~MPEGTS_FLAG_REEMIT_PAT_PMT;
     }
-
+    av_log(NULL, AV_LOG_DEBUG, "PTS Time Stamp %lld DTS Time Stamp %lld CODEC Id %d\n",pts,dts, st->codecpar->codec_id);
+    int is_scte_stream = (st->codecpar->codec_id == AV_CODEC_ID_SCTE_35);
     is_start = 1;
     while (payload_size > 0) {
+        if (is_scte_stream)
+        {
+            SCTEPacket scte_packet = init_scte_packet((uint8_t *)payload, payload_size);
+            av_log(NULL, AV_LOG_INFO, "SCTE Packet Command Type %d \n", scte_packet.splice_command_type);
+            AVRational tb = (AVRational){1,AV_TIME_BASE};
+            uint64_t start_pts = (uint64_t)av_rescale_q(scte_start_pts_time, tb,st->time_base);
+            if (scte_packet.splice_command_type == TIME_SIGNAL)
+            {
+                av_log(NULL, AV_LOG_DEBUG,"Stream Start PTS time %llu, SCTE Time Signal PTS Time %llu, PTS From FFmpeg %lld\n", start_pts, scte_packet.time_signal->splice_time.pts_time, pts);
+                av_log(NULL, AV_LOG_DEBUG,"Difference b/w SCTE and start pts = %llu\n",scte_packet.time_signal->splice_time.pts_time-start_pts);
+                update_splice_pts_time(&scte_packet,(uint64_t)(scte_packet.time_signal->splice_time.pts_time-start_pts));
+            }
+            uint8_t *scte_payload;
+            get_scte_payload(scte_packet, &scte_payload);
+            // print_scte_packet(scte_packet);
+            q    = buf;
+            *q++ = 0x47;  // Sync byte
+            // pid is 13 bits, we are shifting right by 8 bits. val have 5 bits of pid at the right
+            val  = ts_st->pid >> 8;
+            if (is_start)
+                val |= 0x40;
+            *q++      = val; //Traffic Error (0) + Payload Unit Start Indicator + Transport Priority + 1st 5 bits of PID
+            *q++      = ts_st->pid; // remaining 8 bits of PID
+            ts_st->cc = ts_st->cc + 1 & 0xf;
+            *q++      = 0x10 | ts_st->cc; // Transport Scrambling Control (00) + Adaption Field Control (01) +
+            // Continuity Counter
+            *q++ = 0x00; // Section Syntax Indicator =0 + Private Indicator (00);
+            header_len = q - buf;
+//            if (payload_size > TS_PACKET_SIZE-header_len)
+// todo: Add error in case payload_size > left over data size;
+            memcpy(buf + header_len, scte_payload, payload_size);
+            int cur_len = header_len + payload_size;
+            memset(buf + cur_len, 0xff, TS_PACKET_SIZE-cur_len);
+            payload      += payload_size;
+            payload_size = 0;
+            write_packet(s, buf);
+            continue;
+
+        }
         int64_t pcr = AV_NOPTS_VALUE;
         if (ts->mux_rate > 1)
             pcr = get_pcr(ts);

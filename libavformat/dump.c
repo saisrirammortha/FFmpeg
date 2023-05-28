@@ -39,6 +39,7 @@
 #include "avformat.h"
 #include "internal.h"
 
+int64_t scte_start_pts_time =0;
 #define HEXDUMP_PRINT(...)                                                    \
     do {                                                                      \
         if (!f)                                                               \
@@ -652,6 +653,8 @@ void av_dump_format(AVFormatContext *ic, int index,
         if (ic->start_time != AV_NOPTS_VALUE) {
             int secs, us;
             av_log(NULL, AV_LOG_INFO, ", start: ");
+            scte_start_pts_time = ic->start_time;
+
             secs = llabs(ic->start_time / AV_TIME_BASE);
             us   = llabs(ic->start_time % AV_TIME_BASE);
             av_log(NULL, AV_LOG_INFO, "%s%d.%06d",
